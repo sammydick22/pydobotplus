@@ -1,3 +1,4 @@
+from logging import DEBUG
 import pydobotplus
 import math
 import struct
@@ -13,11 +14,11 @@ import serial
 from serial.tools import list_ports
 from collections import deque
 
-
 MAX_QUEUE_LEN = 32
 
+
 class CustomPosition(object):
-    def __init__(self, x = None, y = None, z = None, r = None):
+    def __init__(self, x=None, y=None, z=None, r=None):
         self.x = x
         self.y = y
         self.z = z
@@ -25,7 +26,6 @@ class CustomPosition(object):
 
 
 class MODE_PTP(IntEnum):
-
     JUMP_XYZ = 0x00
     MOVJ_XYZ = 0x01
     MOVL_XYZ = 0x02
@@ -47,7 +47,6 @@ class DobotException(Exception):
 
 
 class Position(NamedTuple):
-
     x: float
     y: float
     z: float
@@ -55,7 +54,6 @@ class Position(NamedTuple):
 
 
 class Joints(NamedTuple):
-
     j1: float
     j2: float
     j3: float
@@ -66,13 +64,11 @@ class Joints(NamedTuple):
 
 
 class Pose(NamedTuple):
-
     position: Position
     joints: Joints
 
 
 class Alarm(IntEnum):
-
     COMMON_RESETTING = 0x00,
     COMMON_UNDEFINED_INSTRUCTION = 0x01,
     COMMON_FILE_SYSTEM = 0x02,
@@ -81,7 +77,7 @@ class Alarm(IntEnum):
 
     PLAN_INV_SINGULARITY = 0x10,
     PLAN_INV_CALC = 0x11,
-    PLAN_INV_LIMIT = 0x12, # !!!
+    PLAN_INV_LIMIT = 0x12,  # !!!
     PLAN_PUSH_DATA_REPEAT = 0x13,
     PLAN_ARC_INPUT_PARAM = 0x14,
     PLAN_JUMP_PARAM = 0x15,
@@ -247,7 +243,7 @@ class Dobot:
             self._ser.close()
         self.logger.debug('pydobot: %s closed' % self._ser.name)
 
-    def _send_command(self, msg, wait = False) -> Message:
+    def _send_command(self, msg, wait=False) -> Message:
         with self._lock:
             self._ser.reset_input_buffer()
             self._send_message(msg)
@@ -256,7 +252,7 @@ class Dobot:
             raise DobotException("No response!")
         if not wait:
             return msg
-        
+
         expected_idx = struct.unpack_from('L', msg.params, 0)[0]
         while True:
             current_idx = self._get_queued_cmd_current_index()
@@ -266,8 +262,6 @@ class Dobot:
                 continue
             break
         return msg
-        
-        
 
     def _send_message(self, msg) -> None:
 
@@ -303,6 +297,29 @@ class Dobot:
                 return msg
         return None
 
+    def get_device_serial_number(self) -> str:
+        msg = Message()
+        msg.id = 0
+        response = self._send_command(msg)
+
+        return response.params.rstrip(b'\x00').decode('ascii')
+
+    def get_device_name(self):
+        msg = Message()
+        msg.id = 1
+        response = self._send_command(msg)
+
+        return response.params.rstrip(b'\x00').decode('ascii')
+
+    def set_device_name(self, device_name: str):
+        msg = Message()
+        msg.id = 1
+        msg.ctrl = 0x01
+        msg.params = bytearray(device_name.encode("ascii"))
+        msg.params.extend([0x00])
+
+        return self._send_command(msg)
+
     def get_pose(self) -> Pose:
         msg = Message()
         msg.id = 10
@@ -334,7 +351,7 @@ class Dobot:
         for idx in range(16):
             alarm_byte = struct.unpack_from('B', response.params, idx)[0]
             for alarm_index in [i for i in range(alarm_byte.bit_length()) if alarm_byte & (1 << i)]:
-                ret.add(Alarm(idx*8+alarm_index))
+                ret.add(Alarm(idx * 8 + alarm_index))
         return ret
 
     def clear_alarms(self) -> None:
@@ -345,6 +362,9 @@ class Dobot:
         self._send_command(msg)  # empty response
 
     def _set_cp_cmd(self, x, y, z):
+        # NOTE: This original method has a bug — it appends a single 0x00 byte
+        # instead of a 4-byte float for the velocity field required by CPCmd.
+        # Use _set_cp_cmd_rt() for correct CP real-time tracking behaviour.
         msg = Message()
         msg.id = 91
         msg.ctrl = 0x03
@@ -354,6 +374,113 @@ class Dobot:
         msg.params.extend(bytearray(struct.pack('f', z)))
         msg.params.append(0x00)
         return self._send_command(msg)
+
+    # ------------------------------------------------------------------ #
+    #  CP real-time tracking  (API section 2.15, realTimeTrack = 1)       #
+    # ------------------------------------------------------------------ #
+
+    def _set_cp_params_realtime(
+        self,
+        plan_acc: float = 100.0,
+        junction_vel: float = 50.0,
+        period: float = 200.0,
+    ) -> Message:
+        """Configure CPParams with realTimeTrack=1.
+
+        CPParams struct layout (from official API):
+            float planAcc       – planning acceleration (mm/s²)
+            float junctionVel   – velocity at segment junctions (mm/s)
+            float period        – ms between waypoints (used when realTimeTrack=1)
+            uint8_t realTimeTrack
+        """
+        msg = Message()
+        msg.id = 90
+        msg.ctrl = 0x03  # queued write
+        msg.params = bytearray()
+        msg.params.extend(struct.pack('f', plan_acc))
+        msg.params.extend(struct.pack('f', junction_vel))
+        msg.params.extend(struct.pack('f', period))
+        msg.params.extend(bytearray([0x01]))  # realTimeTrack = 1
+        return self._send_command(msg)
+
+    def _set_cp_cmd_rt(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        velocity: float = 100.0,
+        cp_mode: int = 1,
+    ) -> Message:
+        """Send a CPCmd with the correct 4-byte float velocity field.
+
+        CPCmd struct layout (from official API):
+            uint8_t cpMode   – 0 = relative, 1 = absolute
+            float   x
+            float   y
+            float   z
+            float   velocity – mm/s
+        """
+        msg = Message()
+        msg.id = 91
+        msg.ctrl = 0x03  # queued write
+        msg.params = bytearray([cp_mode])
+        msg.params.extend(struct.pack('f', x))
+        msg.params.extend(struct.pack('f', y))
+        msg.params.extend(struct.pack('f', z))
+        msg.params.extend(struct.pack('f', velocity))
+        return self._send_command(msg)
+
+    def setup_realtime_tracking(
+        self,
+        plan_acc: float = 100.0,
+        junction_vel: float = 50.0,
+        period: float = 200.0,
+    ) -> None:
+        """Flush the command queue and configure CP real-time tracking mode.
+
+        Call this once during initialisation and again after any stop/clear
+        cycle (e.g. to resync the R axis via PTP).
+
+        Args:
+            plan_acc:     Planning acceleration in mm/s² (default 100).
+            junction_vel: Velocity at waypoint junctions in mm/s (default 50).
+                          Lower = smoother direction changes; higher = faster.
+            period:       Expected interval between send_realtime_point() calls
+                          in milliseconds (default 200).  Must match the sleep
+                          period of the tracking thread.
+        """
+        self._set_queued_cmd_stop_exec()
+        self._set_queued_cmd_clear()
+        self._set_cp_params_realtime(plan_acc, junction_vel, period)
+        self._set_queued_cmd_start_exec()
+
+    def send_realtime_point(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        velocity: float = 100.0,
+    ) -> int:
+        """Queue a CP real-time absolute waypoint and return its queue index.
+
+        Call this at the rate matching the *period* passed to
+        setup_realtime_tracking().  The Dobot firmware chains consecutive CP
+        commands with look-ahead, so changing the target mid-flight results in
+        a smooth redirect rather than a stop-and-go.
+
+        Note: CP mode controls only X/Y/Z.  Use move_to() (PTP) when the R
+        (yaw) axis needs to change, then call setup_realtime_tracking() again
+        to re-enter CP mode.
+
+        Args:
+            x, y, z:  Absolute target in mm.
+            velocity: Travel speed in mm/s (clamped by firmware limits).
+        Returns:
+            Queue command index.
+        """
+        return self._extract_cmd_index(self._set_cp_cmd_rt(x, y, z, velocity, cp_mode=1))
+
+    # ------------------------------------------------------------------ #
 
     def _set_ptp_joint_params(self, v_x, v_y, v_z, v_r, a_x, a_y, a_z, a_r):
         msg = Message()
@@ -548,7 +675,7 @@ class Dobot:
 
     def jog_x(self, v):
 
-        self._set_jog_coordinate_params(abs(v), 0, 0, 0,)
+        self._set_jog_coordinate_params(abs(v), 0, 0, 0, )
         if v > 0:
             cmd = 1
         elif v < 0:
@@ -627,7 +754,6 @@ class Dobot:
         response = self._send_command(msg)
         return bool(struct.unpack_from('B', response.params, 0)[0])
 
-
     def go_arc(self, x, y, z, r, cir_x, cir_y, cir_z, cir_r):
         return self._extract_cmd_index(self._set_arc_cmd(x, y, z, r, cir_x, cir_y, cir_z, cir_r))
 
@@ -691,7 +817,8 @@ class Dobot:
         return self._send_command(msg)
 
     def _set_cp_params(self, velocity, acceleration, period):
-
+        # Original method kept for backwards-compatibility with engrave().
+        # Uses realTimeTrack=0 (non-real-time CP).
         msg = Message()
         msg.id = 90
         msg.ctrl = 0x3
@@ -699,7 +826,7 @@ class Dobot:
         msg.params.extend(bytearray(struct.pack('f', acceleration)))
         msg.params.extend(bytearray(struct.pack('f', velocity)))
         msg.params.extend(bytearray(struct.pack('f', period)))
-        msg.params.extend(bytearray([0x0]))  # non real-time mode (what does it mean??)
+        msg.params.extend(bytearray([0x0]))  # realTimeTrack = 0
         return self._send_command(msg)
 
     def _set_cple_cmd(self, x, y, z, power, absolute=False):
@@ -735,7 +862,7 @@ class Dobot:
         for row_idx, row in enumerate(image):
 
             # first feed the queue to be almost full
-            if stopped and len(indexes) > MAX_QUEUE_LEN-2:
+            if stopped and len(indexes) > MAX_QUEUE_LEN - 2:
                 self._set_queued_cmd_start_exec()
                 stopped = False
 
@@ -751,18 +878,17 @@ class Dobot:
                 if not rev:
                     y_ofs = col_idx * pixel_size
                 else:
-                    y_ofs = (len(row)-1 - col_idx) * pixel_size
+                    y_ofs = (len(row) - 1 - col_idx) * pixel_size
 
                 indexes.append(
                     self._extract_cmd_index(self._set_cple_cmd(x + row_idx * pixel_size, y + y_ofs, z, ld, True)))
 
                 # then feed it as necessary to keep it almost full
-                while not stopped and len(indexes) > MAX_QUEUE_LEN-12:
+                while not stopped and len(indexes) > MAX_QUEUE_LEN - 12:
                     self.wait_for_cmd(indexes.popleft())
 
         self.wait_for_cmd(self.laze(0, False))
-        
-    
+
     PORT_GP1 = 0x00
     PORT_GP2 = 0x01
     PORT_GP4 = 0x02
@@ -772,15 +898,13 @@ class Dobot:
         if speed_mm_per_sec > 100:
             raise pydobotplus.dobot.DobotException("Speed must be <= 100 mm/s")
 
-
         MM_PER_REV = 34 * math.pi  # Seems to actually be closer to 36mm when measured but 34 works better
         STEP_ANGLE_DEG = 1.8
         STEPS_PER_REV = 360.0 / STEP_ANGLE_DEG * 10.0 * 16.0 / 2.0  # Spec sheet says that it can do 1.8deg increments, no idea what the 10 * 16 / 2 fuck factor is....
         distance_steps = distance_mm / MM_PER_REV * STEPS_PER_REV
         speed_steps_per_sec = speed_mm_per_sec / MM_PER_REV * STEPS_PER_REV * direction
-        return self._extract_cmd_index(self._set_stepper_motor_distance(int(speed_steps_per_sec), int(distance_steps), interface))
-
-
+        return self._extract_cmd_index(
+            self._set_stepper_motor_distance(int(speed_steps_per_sec), int(distance_steps), interface))
 
     def set_color(self, enable=True, port=PORT_GP2, version=0x1):
         msg = Message()
@@ -806,7 +930,7 @@ class Dobot:
         g = struct.unpack_from('?', response.params, 1)[0]
         b = struct.unpack_from('?', response.params, 2)[0]
         return [r, g, b]
-    
+
     def set_ir(self, enable=True, port=PORT_GP4):
         msg = Message()
         msg.id = 138
@@ -825,26 +949,25 @@ class Dobot:
         response = self._send_command(msg)
         state = struct.unpack_from('?', response.params, 0)[0]
         return state
-    
-    def move_rel(self, x=0, y=0, z=0, r=0, wait = True):
+
+    def move_rel(self, x=0, y=0, z=0, r=0, wait=True):
         (xInit, yInit, zInit, rInit) = self.get_pose().position
-        self.move_to(xInit+x, yInit+y, zInit+z, rInit+r, wait)
-        
-    
-    def move_to(self, x=None, y=None, z=None, r=0, wait = True, mode=None, position=None):
+        self.move_to(xInit + x, yInit + y, zInit + z, rInit + r, wait)
+
+    def move_to(self, x=None, y=None, z=None, r=0, wait=True, mode=None, position=None):
         if position is not None:
             x, y, z, r = position.x, position.y, position.z, position.r
         elif x is None and y is None and z is None:
             raise ValueError("Either a Position object or x, y, z coordinates must be provided")
-        
+
         current_pose = self.get_pose().position
         if x is None: x = current_pose.x
         if y is None: y = current_pose.y
         if z is None: z = current_pose.z
         if r is None: r = current_pose.r
         print(current_pose)
-        
+
         if mode is None:
             mode = MODE_PTP.MOVJ_XYZ  # Use default mode if not provided
-            
-        return self._extract_cmd_index(self._set_ptp_cmd(x, y, z, r, mode, wait = wait))
+
+        return self._extract_cmd_index(self._set_ptp_cmd(x, y, z, r, mode, wait=wait))
